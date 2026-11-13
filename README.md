@@ -18,8 +18,10 @@ The program loads each matching dataset pair from `data/non_tries/` and
 - `MaxEtMinA` and `MaxEtMinB` on the unsorted table
 
 Searches use an absent value greater than the data maximum so the sequential
-searches scan the full table. Output reports the average time per call in
-microseconds. CSV loading is separate from the array-based functions.
+searches scan the full table. Output reports the best and worst time per call in
+microseconds across three timed rounds for every function. For `MaxEtMinA` and
+`MaxEtMinB`, it also reports one comparisons-per-call count. CSV loading is
+separate from the array-based functions.
 
 ## Source files
 

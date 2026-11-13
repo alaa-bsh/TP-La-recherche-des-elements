@@ -9,9 +9,16 @@
 
 #define BENCHMARK_ELEMENTS 5000000L
 #define MIN_REPETITIONS 3L
+#define BENCHMARK_ROUNDS 3L
 
 static volatile int search_sink;
 static volatile int min_max_sink;
+
+typedef struct {
+    double best_us;
+    double worst_us;
+    long comparisons_per_call;
+} BenchmarkTimings;
 
 typedef int (*SearchFunction)(int[], int, int);
 typedef void (*MinMaxFunction)(int[], int, int *, int *, long *);
@@ -80,49 +87,95 @@ static long repetitions_for(int count)
     return repetitions < MIN_REPETITIONS ? MIN_REPETITIONS : repetitions;
 }
 
-static double benchmark_search(SearchFunction function, int *table, int count,
-                               int target, long repetitions)
+static BenchmarkTimings benchmark_search(SearchFunction function, int *table,
+                                         int count, int target,
+                                         long repetitions)
 {
-    struct timespec start, finish;
-    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
-        perror("clock_gettime");
-        exit(EXIT_FAILURE);
-    }
-    for (long i = 0; i < repetitions; ++i) {
-        search_sink = function(table, count, target);
-    }
-    if (clock_gettime(CLOCK_MONOTONIC, &finish) != 0) {
-        perror("clock_gettime");
-        exit(EXIT_FAILURE);
+    BenchmarkTimings timings = {
+        .best_us = 0.0,
+        .worst_us = 0.0,
+        .comparisons_per_call = 0
+    };
+
+    for (long round = 0; round < BENCHMARK_ROUNDS; ++round) {
+        long round_repetitions = repetitions / BENCHMARK_ROUNDS;
+        if (round < repetitions % BENCHMARK_ROUNDS) {
+            ++round_repetitions;
+        }
+
+        struct timespec start, finish;
+        if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+            perror("clock_gettime");
+            exit(EXIT_FAILURE);
+        }
+        for (long i = 0; i < round_repetitions; ++i) {
+            search_sink = function(table, count, target);
+        }
+        if (clock_gettime(CLOCK_MONOTONIC, &finish) != 0) {
+            perror("clock_gettime");
+            exit(EXIT_FAILURE);
+        }
+
+        double elapsed_ns = (double)(finish.tv_sec - start.tv_sec) * 1e9
+                          + (double)(finish.tv_nsec - start.tv_nsec);
+        double round_us = elapsed_ns / round_repetitions / 1000.0;
+        if (round == 0 || round_us < timings.best_us) {
+            timings.best_us = round_us;
+        }
+        if (round == 0 || round_us > timings.worst_us) {
+            timings.worst_us = round_us;
+        }
     }
 
-    double elapsed_ns = (double)(finish.tv_sec - start.tv_sec) * 1e9
-                      + (double)(finish.tv_nsec - start.tv_nsec);
-    return elapsed_ns / repetitions / 1000.0;
+    return timings;
 }
 
-static double benchmark_min_max(MinMaxFunction function, int *table, int count,
-                                long repetitions, long *comparisons)
+static BenchmarkTimings benchmark_min_max(MinMaxFunction function, int *table,
+                                          int count, long repetitions)
 {
+    BenchmarkTimings timings = {
+        .best_us = 0.0,
+        .worst_us = 0.0,
+        .comparisons_per_call = 0
+    };
     int max, min;
-    struct timespec start, finish;
-    *comparisons = 0;
-    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
-        perror("clock_gettime");
-        exit(EXIT_FAILURE);
-    }
-    for (long i = 0; i < repetitions; ++i) {
-        function(table, count, &max, &min, comparisons);
-        min_max_sink = max ^ min;
-    }
-    if (clock_gettime(CLOCK_MONOTONIC, &finish) != 0) {
-        perror("clock_gettime");
-        exit(EXIT_FAILURE);
+    long total_comparisons = 0;
+
+    for (long round = 0; round < BENCHMARK_ROUNDS; ++round) {
+        long round_repetitions = repetitions / BENCHMARK_ROUNDS;
+        if (round < repetitions % BENCHMARK_ROUNDS) {
+            ++round_repetitions;
+        }
+
+        struct timespec start, finish;
+        if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+            perror("clock_gettime");
+            exit(EXIT_FAILURE);
+        }
+        for (long i = 0; i < round_repetitions; ++i) {
+            long call_comparisons = 0;
+            function(table, count, &max, &min, &call_comparisons);
+            total_comparisons += call_comparisons;
+            min_max_sink = max ^ min;
+        }
+        if (clock_gettime(CLOCK_MONOTONIC, &finish) != 0) {
+            perror("clock_gettime");
+            exit(EXIT_FAILURE);
+        }
+
+        double elapsed_ns = (double)(finish.tv_sec - start.tv_sec) * 1e9
+                          + (double)(finish.tv_nsec - start.tv_nsec);
+        double round_us = elapsed_ns / round_repetitions / 1000.0;
+        if (round == 0 || round_us < timings.best_us) {
+            timings.best_us = round_us;
+        }
+        if (round == 0 || round_us > timings.worst_us) {
+            timings.worst_us = round_us;
+        }
     }
 
-    double elapsed_ns = (double)(finish.tv_sec - start.tv_sec) * 1e9
-                      + (double)(finish.tv_nsec - start.tv_nsec);
-    return elapsed_ns / repetitions / 1000.0;
+    timings.comparisons_per_call = total_comparisons / repetitions;
+    return timings;
 }
 
 static int is_sorted(const int *table, int count)
@@ -144,8 +197,9 @@ int main(void)
     };
     const size_t size_count = sizeof(sizes) / sizeof(sizes[0]);
 
-    printf("%-10s %-25s %-18s %-14s %s\n",
-           "n", "function", "input table", "repetitions", "average (us/call)");
+    printf("%-10s %-25s %-18s %-8s %14s %14s %18s\n",
+           "n", "function", "input table", "calls",
+           "best (us/call)", "worst (us/call)", "comparisons/call");
 
     for (size_t index = 0; index < size_count; ++index) {
         int count = sizes[index];
@@ -197,33 +251,35 @@ int main(void)
         }
 
         long repetitions = repetitions_for(count);
-        double time_us;
-        long comparisons;
+        BenchmarkTimings timings;
 
-        time_us = benchmark_search(rechElets_TabNonTries, unsorted, count,
+        timings = benchmark_search(rechElets_TabNonTries, unsorted, count,
                                    absent_target, repetitions);
-        printf("%-10d %-25s %-18s %-14ld %.3f\n",
-               count, "rechElets_TabNonTries", "non_tries", repetitions, time_us);
+        printf("%-10d %-25s %-18s %-8ld %14.3f %14.3f %18s\n",
+               count, "rechElets_TabNonTries", "non_tries", repetitions,
+               timings.best_us, timings.worst_us, "-");
 
-        time_us = benchmark_search(rechElets_TabTries, sorted, count,
+        timings = benchmark_search(rechElets_TabTries, sorted, count,
                                    absent_target, repetitions);
-        printf("%-10d %-25s %-18s %-14ld %.3f\n",
-               count, "rechElets_TabTries", "tries", repetitions, time_us);
+        printf("%-10d %-25s %-18s %-8ld %14.3f %14.3f %18s\n",
+               count, "rechElets_TabTries", "tries", repetitions,
+               timings.best_us, timings.worst_us, "-");
 
-        time_us = benchmark_search(rechElets_Dicho, sorted, count,
+        timings = benchmark_search(rechElets_Dicho, sorted, count,
                                    absent_target, repetitions);
-        printf("%-10d %-25s %-18s %-14ld %.3f\n",
-               count, "rechElets_Dicho", "tries", repetitions, time_us);
+        printf("%-10d %-25s %-18s %-8ld %14.3f %14.3f %18s\n",
+               count, "rechElets_Dicho", "tries", repetitions,
+               timings.best_us, timings.worst_us, "-");
 
-        time_us = benchmark_min_max(MaxEtMinA, unsorted, count,
-                                    repetitions, &comparisons);
-        printf("%-10d %-25s %-18s %-14ld %.3f\n",
-               count, "MaxEtMinA", "non_tries", repetitions, time_us);
+        timings = benchmark_min_max(MaxEtMinA, unsorted, count, repetitions);
+        printf("%-10d %-25s %-18s %-8ld %14.3f %14.3f %18ld\n",
+               count, "MaxEtMinA", "non_tries", repetitions,
+               timings.best_us, timings.worst_us, timings.comparisons_per_call);
 
-        time_us = benchmark_min_max(MaxEtMinB, unsorted, count,
-                                    repetitions, &comparisons);
-        printf("%-10d %-25s %-18s %-14ld %.3f\n",
-               count, "MaxEtMinB", "non_tries", repetitions, time_us);
+        timings = benchmark_min_max(MaxEtMinB, unsorted, count, repetitions);
+        printf("%-10d %-25s %-18s %-8ld %14.3f %14.3f %18ld\n",
+               count, "MaxEtMinB", "non_tries", repetitions,
+               timings.best_us, timings.worst_us, timings.comparisons_per_call);
 
         free(unsorted);
         free(sorted);
